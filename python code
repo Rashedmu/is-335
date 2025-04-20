@@ -1,0 +1,198 @@
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from flask import Flask, request, jsonify
+
+app = Flask(__name__)
+
+DB_CONFIG = {
+    'dbname': 'fakeuberproject',
+    'user': 'postgres',
+    'password': '1234',
+    'host': 'localhost',
+    'port': 5432
+}
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    return jsonify({"status": "ok"}), 200
+
+@app.route('/api/trips', methods=['POST'])
+def create_trip():
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "Invalid JSON"}), 400
+
+    customer_id = data.get("customer_id")
+    pickup_point = data.get("pickup_point")
+    dropoff_point = data.get("dropoff_point")
+
+    if not customer_id or not pickup_point or not dropoff_point:
+        return jsonify({"error": "Missing required fields"}), 400
+
+    if len(pickup_point) != 2 or len(dropoff_point) != 2:
+        return jsonify({"error": "pickup_point and dropoff_point must be [lon, lat]"}), 400
+
+    pickup_wkt = f"POINT({pickup_point[0]} {pickup_point[1]})"
+    dropoff_wkt = f"POINT({dropoff_point[0]} {dropoff_point[1]})"
+
+    conn = None
+    try:
+        conn = psycopg2.connect(**DB_CONFIG)
+        conn.autocommit = False
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+
+        surge_query = """
+            SELECT "surge_area_ID", "surge_multiplier"
+            FROM "SurgeArea"
+            WHERE ST_Within(
+                ST_GeomFromText(%s, 4326),
+                "boundary_definition"
+            )
+            LIMIT 1
+        """
+        cur.execute(surge_query, (pickup_wkt,))
+        surge_result = cur.fetchone()
+
+        surge_area_id = None
+        surge_multiplier = 1.0
+
+        if surge_result:
+            surge_area_id = surge_result["surge_area_ID"]
+            surge_multiplier = float(surge_result["surge_multiplier"])
+
+        total_price = 10.0 * surge_multiplier
+
+        insert_trip_query = """
+            INSERT INTO "Trip" (
+                "trip_status",
+                "customer_id",
+                "driver_id",
+                "surge_area_ID",
+                "total_price",
+                "distance",
+                "start_time",
+                "end_time",
+                "duration",
+                "pickUp_loc",
+                "dropOff_loc"
+            )
+            VALUES (
+                'Pending',
+                %s,
+                NULL,
+                %s,
+                %s,
+                0,
+                NOW(),
+                NULL,
+                '00:00:00',
+                ST_GeomFromText(%s, 4326),
+                ST_GeomFromText(%s, 4326)
+            )
+            RETURNING *
+        """
+        cur.execute(
+            insert_trip_query,
+            (customer_id, surge_area_id, total_price, pickup_wkt, dropoff_wkt)
+        )
+        new_trip = cur.fetchone()
+
+        if "duration" in new_trip and not isinstance(new_trip["duration"], (str, bytes)):
+            new_trip["duration"] = str(new_trip["duration"])
+
+        conn.commit()
+        return jsonify(new_trip), 201
+
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        if conn:
+            conn.close()
+
+@app.route('/api/trips/<trip_id>/accept', methods=['POST'])
+def accept_trip(trip_id):
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "Invalid JSON"}), 400
+
+    driver_id = data.get("driver_id")
+    if not driver_id:
+        return jsonify({"error": "Missing driver_id"}), 400
+
+    conn = None
+    try:
+        conn = psycopg2.connect(**DB_CONFIG)
+        conn.autocommit = False
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+
+        lock_driver_query = """
+            SELECT *
+            FROM "Driver"
+            WHERE "Dri_id" = %s
+            FOR UPDATE
+        """
+        cur.execute(lock_driver_query, (driver_id,))
+        driver_row = cur.fetchone()
+
+        if not driver_row:
+            conn.rollback()
+            return jsonify({"error": "Driver not found"}), 404
+
+        if driver_row["status"] != "Available":
+            conn.rollback()
+            return jsonify({"error": "Driver is not available"}), 400
+
+        lock_trip_query = """
+            SELECT *
+            FROM "Trip"
+            WHERE "trip_id" = %s
+            FOR UPDATE
+        """
+        cur.execute(lock_trip_query, (trip_id,))
+        trip_row = cur.fetchone()
+
+        if not trip_row:
+            conn.rollback()
+            return jsonify({"error": "Trip not found"}), 404
+
+        if trip_row["trip_status"] != "Pending":
+            conn.rollback()
+            return jsonify({"error": "Trip is not pending"}), 400
+
+        update_trip_query = """
+            UPDATE "Trip"
+            SET "trip_status" = 'Ongoing',
+                "driver_id" = %s
+            WHERE "trip_id" = %s
+            RETURNING *
+        """
+        cur.execute(update_trip_query, (driver_id, trip_id))
+        updated_trip = cur.fetchone()
+
+        update_driver_query = """
+            UPDATE "Driver"
+            SET "status" = 'On Trip'
+            WHERE "Dri_id" = %s
+        """
+        cur.execute(update_driver_query, (driver_id,))
+
+        if "duration" in updated_trip and not isinstance(updated_trip["duration"], (str, bytes)):
+            updated_trip["duration"] = str(updated_trip["duration"])
+
+        conn.commit()
+        return jsonify(updated_trip), 200
+
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        if conn:
+            conn.close()
+
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=5000)
