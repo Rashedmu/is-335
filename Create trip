@@ -1,0 +1,5 @@
+{
+  "customer_id": "564ce5ad-ac94-4adb-ac42-924614930056",
+  "pickup_point": [50.12345, 26.54321],
+  "dropoff_point": [50.22345, 26.64321]
+}
