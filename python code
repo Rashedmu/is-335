@@ -25,8 +25,9 @@ def create_trip():
     customer_id = data.get("customer_id")
     pickup_point = data.get("pickup_point")
     dropoff_point = data.get("dropoff_point")
+    vehicle_type = data.get("vehicle_type")
 
-    if not customer_id or not pickup_point or not dropoff_point:
+    if not customer_id or not pickup_point or not dropoff_point or not vehicle_type:
         return jsonify({"error": "Missing required fields"}), 400
 
     if len(pickup_point) != 2 or len(dropoff_point) != 2:
@@ -41,13 +42,11 @@ def create_trip():
         conn.autocommit = False
         cur = conn.cursor(cursor_factory=RealDictCursor)
 
+        # Check for surge area
         surge_query = """
             SELECT "surge_area_ID", "surge_multiplier"
             FROM "SurgeArea"
-            WHERE ST_Within(
-                ST_GeomFromText(%s, 4326),
-                "boundary_definition"
-            )
+            WHERE ST_Within(ST_GeomFromText(%s, 4326), "boundary_definition")
             LIMIT 1
         """
         cur.execute(surge_query, (pickup_wkt,))
@@ -55,59 +54,60 @@ def create_trip():
 
         surge_area_id = None
         surge_multiplier = 1.0
-
         if surge_result:
             surge_area_id = surge_result["surge_area_ID"]
             surge_multiplier = float(surge_result["surge_multiplier"])
 
+        # Get nearest 5 drivers with correct vehicle type
+        driver_query = """
+            SELECT 
+                d."Dri_id", d."name", d."location", v."vehicle_type"
+            FROM "Driver" d
+            JOIN "Vehicle" v ON d."Vehicle_id" = v."vehicle_id"
+            WHERE d."status" = 'Available'
+              AND v."vehicle_type" = %s
+              AND ST_DWithin(d."location", ST_GeomFromText(%s, 4326), 5000)
+            ORDER BY ST_Distance(d."location", ST_GeomFromText(%s, 4326))
+            LIMIT 5
+        """
+        cur.execute(driver_query, (vehicle_type, pickup_wkt, pickup_wkt))
+        drivers = cur.fetchall()
+
+        if not drivers:
+            conn.rollback()
+            return jsonify({"error": "No nearby drivers available"}), 404
+
+        # For simplicity, base price is hardcoded
         total_price = 10.0 * surge_multiplier
 
         insert_trip_query = """
             INSERT INTO "Trip" (
-                "trip_status",
-                "customer_id",
-                "driver_id",
-                "surge_area_ID",
-                "total_price",
-                "distance",
-                "start_time",
-                "end_time",
-                "duration",
-                "pickUp_loc",
-                "dropOff_loc"
+                "trip_status", "customer_id", "driver_id",
+                "surge_area_ID", "total_price", "distance",
+                "start_time", "end_time", "duration",
+                "pickUp_loc", "dropOff_loc"
             )
             VALUES (
-                'Pending',
-                %s,
-                NULL,
-                %s,
-                %s,
-                0,
-                NOW(),
-                NULL,
-                '00:00:00',
+                'Pending', %s, NULL, %s, %s, 0,
+                NOW(), NULL, '00:00:00',
                 ST_GeomFromText(%s, 4326),
                 ST_GeomFromText(%s, 4326)
             )
             RETURNING *
         """
-        cur.execute(
-            insert_trip_query,
-            (customer_id, surge_area_id, total_price, pickup_wkt, dropoff_wkt)
-        )
+        cur.execute(insert_trip_query, (customer_id, surge_area_id, total_price, pickup_wkt, dropoff_wkt))
         new_trip = cur.fetchone()
 
         if "duration" in new_trip and not isinstance(new_trip["duration"], (str, bytes)):
             new_trip["duration"] = str(new_trip["duration"])
 
         conn.commit()
-        return jsonify(new_trip), 201
+        return jsonify({"trip": new_trip, "nearest_drivers": drivers}), 201
 
     except Exception as e:
         if conn:
             conn.rollback()
         return jsonify({"error": str(e)}), 500
-
     finally:
         if conn:
             conn.close()
@@ -128,13 +128,11 @@ def accept_trip(trip_id):
         conn.autocommit = False
         cur = conn.cursor(cursor_factory=RealDictCursor)
 
-        lock_driver_query = """
-            SELECT *
-            FROM "Driver"
-            WHERE "Dri_id" = %s
-            FOR UPDATE
-        """
-        cur.execute(lock_driver_query, (driver_id,))
+        # Lock driver
+        cur.execute("""
+            SELECT * FROM "Driver"
+            WHERE "Dri_id" = %s FOR UPDATE
+        """, (driver_id,))
         driver_row = cur.fetchone()
 
         if not driver_row:
@@ -145,13 +143,11 @@ def accept_trip(trip_id):
             conn.rollback()
             return jsonify({"error": "Driver is not available"}), 400
 
-        lock_trip_query = """
-            SELECT *
-            FROM "Trip"
-            WHERE "trip_id" = %s
-            FOR UPDATE
-        """
-        cur.execute(lock_trip_query, (trip_id,))
+        # Lock trip
+        cur.execute("""
+            SELECT * FROM "Trip"
+            WHERE "trip_id" = %s FOR UPDATE
+        """, (trip_id,))
         trip_row = cur.fetchone()
 
         if not trip_row:
@@ -162,22 +158,22 @@ def accept_trip(trip_id):
             conn.rollback()
             return jsonify({"error": "Trip is not pending"}), 400
 
-        update_trip_query = """
+        # Update trip
+        cur.execute("""
             UPDATE "Trip"
             SET "trip_status" = 'Ongoing',
                 "driver_id" = %s
             WHERE "trip_id" = %s
             RETURNING *
-        """
-        cur.execute(update_trip_query, (driver_id, trip_id))
+        """, (driver_id, trip_id))
         updated_trip = cur.fetchone()
 
-        update_driver_query = """
+        # Update driver
+        cur.execute("""
             UPDATE "Driver"
             SET "status" = 'On Trip'
             WHERE "Dri_id" = %s
-        """
-        cur.execute(update_driver_query, (driver_id,))
+        """, (driver_id,))
 
         if "duration" in updated_trip and not isinstance(updated_trip["duration"], (str, bytes)):
             updated_trip["duration"] = str(updated_trip["duration"])
@@ -189,7 +185,6 @@ def accept_trip(trip_id):
         if conn:
             conn.rollback()
         return jsonify({"error": str(e)}), 500
-
     finally:
         if conn:
             conn.close()
