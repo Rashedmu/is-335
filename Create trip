@@ -1,5 +1,6 @@
 {
   "customer_id": "564ce5ad-ac94-4adb-ac42-924614930056",
-  "pickup_point": [50.12345, 26.54321],
-  "dropoff_point": [50.22345, 26.64321]
+  "pickup_point": [12.9716, 77.5946],
+  "dropoff_point": [12.9352, 77.6245],
+  "vehicle_type": "SUV"
 }
